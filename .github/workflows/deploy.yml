@@ -1,0 +1,82 @@
+name: Build & Deploy (master)
+on:
+  push:
+    branches: [ master ]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR (for build & push)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build & Push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/stefankunde/rollplusplus-backend:master
+          cache-from: type=registry,ref=ghcr.io/stefankunde/rollplusplus-backend:master
+          cache-to: type=inline
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH redeploy backend
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
+          command_timeout: 15m
+          script_stop: true
+          # ⬇️ forward these to the remote shell
+          envs: GHCR_USER,GHCR_TOKEN,BACKEND_ENV_FILE
+          script: |
+            set -euo pipefail
+            umask 077
+            install -d -m 700 /opt/rolldigger/infra/env
+
+            # Require the secret (fail clearly if missing)
+            if [ -z "${BACKEND_ENV_FILE:-}" ]; then
+              echo "ERROR: Missing BACKEND_ENV_FILE secret"; exit 1
+            fi
+
+            # (Optional) prove we received it without printing contents
+            echo "BACKEND_ENV_FILE received: $(printf '%s' "$BACKEND_ENV_FILE" | wc -c) bytes"
+
+            # Write the env file exactly as provided (strip CR if pasted from Windows)
+            tmp="$(mktemp)"
+            printf '%s\n' "$BACKEND_ENV_FILE" > "$tmp"
+            sed -i 's/\r$//' "$tmp"
+            install -m 600 "$tmp" /opt/rolldigger/infra/env/backend.env
+            rm -f "$tmp"
+
+            # GHCR login (skip if public)
+            if [ -n "${GHCR_TOKEN:-}" ]; then
+              echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            fi
+
+            cd /opt/rolldigger/infra
+            docker network create rolldigger-net || true
+
+            # ➜ Tag inline
+            BACKEND_TAG=master docker compose pull backend
+            BACKEND_TAG=master docker compose up -d backend
+
+            docker system prune -f
+        env:
+          GHCR_USER:          ${{ secrets.GHCR_USER }}
+          GHCR_TOKEN:         ${{ secrets.GHCR_TOKEN }}
+          BACKEND_ENV_FILE:   ${{ secrets.BACKEND_ENV_FILE }}   # ⬅️ define it here
